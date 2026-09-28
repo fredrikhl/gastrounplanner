@@ -101,6 +101,12 @@ def format_ical_shifts(shifts):
 END_OF_DAY = datetime.time.max.replace(microsecond=0)
 
 
+def parse_time(value, time_format="%H:%M"):
+    # datetime.time.strptime is introduced in 3.14
+    dt = datetime.datetime.strptime(value, time_format)
+    return dt.time()
+
+
 def parse_timespan(time_range, at_date, truncate=False):
     """
     Parse a time range string into a datetime range.
@@ -117,9 +123,8 @@ def parse_timespan(time_range, at_date, truncate=False):
     start_date = end_date = at_date
 
     start_time_str, end_time_str = time_range.split("-")
-
-    start_time = datetime.time.strptime(start_time_str, "%H:%M")
-    end_time = datetime.time.strptime(end_time_str, "%H:%M")
+    start_time = parse_time(start_time_str)
+    end_time = parse_time(end_time_str)
 
     if end_time <= start_time:
         # Timestamp passes midnight - we either truncate to end of day, or
