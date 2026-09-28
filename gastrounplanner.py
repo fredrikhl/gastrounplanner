@@ -197,7 +197,7 @@ class GastroUnplanner(object):
                 and response.headers["Location"] == self.login_redir_url):
             self.logged_in = True
         else:
-            raise Exception("Unable to login to: %s", repr(self.login_url))
+            raise RuntimeError("Unable to login to: " + repr(self.login_url))
 
     def get_shifts_at(self, date):
         """
