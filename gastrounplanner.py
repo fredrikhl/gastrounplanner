@@ -8,9 +8,15 @@ import hashlib
 import logging
 import pathlib
 import re
+import sys
 import textwrap
-import tomllib
 import uuid
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    # pre-3.11 compatibilty import - requires tomli
+    import tomli as tomllib
 
 import requests
 from bs4 import BeautifulSoup
