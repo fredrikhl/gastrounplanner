@@ -7,7 +7,6 @@ import datetime
 import hashlib
 import logging
 import re
-import textwrap
 import tomllib
 import uuid
 
@@ -18,39 +17,127 @@ from bs4 import BeautifulSoup
 Shift = collections.namedtuple("Shift", ["name", "shift_name", "start", "end"])
 
 
-def parse_timespan(time_range, date):
-    # Parses a simple time range string, like "19:00-23:00", to an end and
-    # start time.  It needs the date for the start time.
-    logging.debug("Parsing time range, %s, of day %s",
-                  time_range, date.isoformat())
+#
+# Shift formatting utils
+#
 
-    date_str = datetime.datetime.strftime(date, "%Y-%m-%d")
+
+FORMAT_VCALENDAR_START = (
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//github.com/paalbra//NONSGML gastrounplanner//EN",
+)
+FORMAT_VEVENT = (
+    "BEGIN:VEVENT",
+    "UID:{uid}",
+    "SUMMARY:{shift_name}",
+    "DTSTAMP:{start}",
+    "DTSTART:{start}",
+    "DTEND:{end}",
+    "END:VEVENT",
+)
+FORMAT_VCALENDAR_END = (
+    "END:VCALENDAR",
+)
+
+
+def _format_dt(dt):
+    return dt.strftime("%Y%m%dT%H%M%S")
+
+
+def _format_ical_shift(shift):
+    ident = f"{shift.shift_name}{shift.start}{shift.end}"
+    md5 = hashlib.md5(ident.encode("utf-8"))
+    uid = str(uuid.UUID(md5.hexdigest()))
+    vevent_data = {
+        'uid': uid,
+        'shift_name': shift.shift_name,
+        'start': _format_dt(shift.start),
+        'end': _format_dt(shift.end),
+    }
+    for line in FORMAT_VEVENT:
+        yield line.format(**vevent_data)
+
+
+def _generate_ical(shifts):
+    for line in FORMAT_VCALENDAR_START:
+        yield line
+
+    for shift in shifts:
+        yield from _format_ical_shift(shift)
+
+    for line in FORMAT_VCALENDAR_END:
+        yield line
+
+    yield ""
+
+
+def format_ical_shifts(shifts):
+    """
+    Format a list of shifts into a RFC-5545 iCalendar VCALENDAR object.
+
+    :param datetime.date date: the base date
+    :param int days_before: start date, in days relative to *date*
+    :param int days_after: end date, in days relative to *date* (not inclusive)
+
+    :rtype: iterator[datetime.date]
+    """
+    return "\r\n".join(_generate_ical(shifts))
+
+
+#
+# Shift parsing
+#
+
+
+END_OF_DAY = datetime.time.max.replace(microsecond=0)
+
+
+def parse_timespan(time_range, at_date, truncate=False):
+    """
+    Parse a time range string into a datetime range.
+
+    :param str time_range: time range, e.g. "19:00-23:00"
+    :param date at_date: start date for the time range
+    :param bool truncate:
+        Truncate range to END_OF_DAY if it wraps to the next day
+
+    :rtype: tuple[datetime.datetime, datetime.datetime]
+    """
+    logging.debug("Parsing time range=%s (at date=%s, truncate=%r)",
+                  repr(time_range), at_date.isoformat(), repr(truncate))
+    start_date = end_date = at_date
+
     start_time_str, end_time_str = time_range.split("-")
 
-    start_time = datetime.datetime.strptime(
-        f"{date_str} {start_time_str}",
-        "%Y-%m-%d %H:%M",
-    )
-    end_time = datetime.datetime.strptime(
-        f"{date_str} {end_time_str}",
-        "%Y-%m-%d %H:%M",
-    )
+    start_time = datetime.time.strptime(start_time_str, "%H:%M")
+    end_time = datetime.time.strptime(end_time_str, "%H:%M")
 
     if end_time <= start_time:
-        # Adjust end day if we are passing midnight, like "21:00-01:00".
-        end_time += datetime.timedelta(days=1)
+        # Timestamp passes midnight - we either truncate to end of day, or
+        # push the end-date to next day
+        if truncate:
+            end_time = END_OF_DAY
+        else:
+            # Adjust end day if we are passing midnight, like "21:00-01:00".
+            end_date += datetime.timedelta(days=1)
 
-    return start_time, end_time
+    return (
+        datetime.datetime.combine(start_date, start_time),
+        datetime.datetime.combine(end_date, end_time),
+    )
 
 
 def parse_shifts(content, date, truncate=False):
-    # The shift data itself only knows what timespan the shifts are.
-    # We therefore have to know which day it is through "date".
-    # "truncate" will make sure no shift passes midnight
-    # (end them 23:59:59 same day).
+    """
+    Parse day shifts into Shift tuples.
 
-    datetime.datetime.strftime(date, "%Y-%m-%d")
+    :param str content: shifts page content
+    :param datetime.date date: the date these shifts are for
+    :param bool truncate: truncate shifts to END_OF_DAY if they pass midnight
 
+    :rtype: iterator[Shift]
+    """
     soup = BeautifulSoup(content, "html.parser")
 
     for tr in soup.find_all("tr", {"class": "timetracker_row_expand"}):
@@ -69,80 +156,9 @@ def parse_shifts(content, date, truncate=False):
             continue
 
         shift_timespan = tds[1].text
-        start_time, end_time = parse_timespan(shift_timespan, date)
-
-        if truncate:
-            start_time, end_time = truncate_to_day(start_time, end_time)
+        start_time, end_time = parse_timespan(shift_timespan, date, truncate)
 
         yield Shift(name, shift_name, start_time, end_time)
-
-
-FORMAT_VCALENDAR_START = (
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//github.com/paalbra//NONSGML gastrounplanner//EN",
-)
-FORMAT_VCALENDAR_END = (
-    "END:VCALENDAR",
-)
-FORMAT_VEVENT = textwrap.dedent(
-    """
-    BEGIN:VEVENT
-    UID:{uid}
-    SUMMARY:{name}
-    DTSTAMP:{start}
-    DTSTART:{start}
-    DTEND:{end}
-    END:VEVENT
-    """
-).lstrip()
-
-
-def _format_dt(dt):
-    return dt.strftime("%Y%m%dT%H%M%S")
-
-
-def _format_ical_shift(shift):
-    ident = f"{shift.shift_name}{shift.start}{shift.end}"
-    md5 = hashlib.md5(ident.encode("utf-8"))
-    uid = str(uuid.UUID(md5.hexdigest()))
-    text = FORMAT_VEVENT.format(
-        uid=uid,
-        name=shift.shift_name,
-        start=_format_dt(shift.start),
-        end=_format_dt(shift.end),
-    )
-    return text.strip().split("\n")
-
-
-def _generate_ical(shifts):
-    for line in FORMAT_VCALENDAR_START:
-        yield line
-    for shift in shifts:
-        for line in _format_ical_shift(shift):
-            yield line
-    for line in FORMAT_VCALENDAR_END:
-        yield line
-    yield ""
-
-
-def format_ical_shifts(shifts):
-    return "\r\n".join(_generate_ical(shifts))
-
-
-def truncate_to_day(start_time, end_time):
-    # Truncate end times to 23:59:59 of start time if they pass midnight.
-    if end_time.date() > start_time.date():
-        end_time = datetime.datetime.combine(
-            start_time.date(),
-            datetime.datetime.max.time().replace(microsecond=0),
-        )
-    return start_time, end_time
-
-
-def generate_date_range(date, days_before, days_after):
-    for days in range(days_before, days_after):
-        yield date + datetime.timedelta(days=days)
 
 
 class GastroUnplanner():
@@ -155,18 +171,22 @@ class GastroUnplanner():
 
     @property
     def login_url(self):
+        """ login url (login POST target). """
         return self.base_url + "index.php?controller=TimeSheet"
 
     @property
     def login_redir_url(self):
+        """ login redirect url (expected login redirect). """
         return self.base_url + "index.php?controller=TimeSheet&action=welcome"
 
     @property
     def shifts_url(self):
+        """ shifts url (list shifts at a given date). """
         return (self.base_url +
                 "index.php?controller=TimeSheet&action=getPersonalList")
 
     def login(self, login_email, login_password):
+        """ Perform a login for the current session. """
         response = self.session.post(
             self.login_url,
             data={
@@ -183,6 +203,13 @@ class GastroUnplanner():
             raise Exception("Unable to login to: %s", repr(self.login_url))
 
     def get_shifts_at(self, date):
+        """
+        Get shifts at a given date.
+
+        :type date: datetime.date
+
+        :rtype: iterator[Shift]
+        """
         response = self.session.post(
             self.shifts_url,
             data={
@@ -194,15 +221,34 @@ class GastroUnplanner():
                 "X-Requested-With": "XMLHttpRequest",
             },
         )
-        # returns a generator
         return parse_shifts(response.text, date, truncate=self.truncate)
 
     def get_shifts(self, days_since, days_until):
+        """
+        Get all shifts in a given date range.
+
+        :param int days_since:
+            start date, in days relative to today
+
+        :param int days_until:
+            end date, non-inclusive, in days relative to today
+
+        :rtype: iterator[Shift]
+        """
         if not self.logged_in:
             return
-        today = datetime.datetime.today().date()
-        for date in generate_date_range(today, days_since, days_until):
+        today = datetime.date.today()
+        dates = (
+            today + datetime.timedelta(days=d)
+            for d in range(days_since, days_until)
+        )
+        for date in dates:
             yield from self.get_shifts_at(date)
+
+
+#
+# Script
+#
 
 
 parser = argparse.ArgumentParser(
@@ -223,6 +269,7 @@ def main(argv=None):
 
     gu = GastroUnplanner(config["url"])
     gu.login(config["email"], config["password"])
+
     # Get shifts. Since 7 days ago and until 30 days forward, by default.
     shifts = gu.get_shifts(args.since, args.until)
 
