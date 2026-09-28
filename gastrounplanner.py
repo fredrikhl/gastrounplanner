@@ -26,71 +26,53 @@ Shift = collections.namedtuple("Shift", ["name", "shift_name", "start", "end"])
 
 
 #
-# Shift formatting utils
+# iCalendar formatting for Shifts
 #
 
-
-FORMAT_VCALENDAR_START = (
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//github.com/paalbra//NONSGML gastrounplanner//EN",
-)
-FORMAT_VEVENT = (
-    "BEGIN:VEVENT",
-    "UID:{uid}",
-    "SUMMARY:{shift_name}",
-    "DTSTAMP:{start}",
-    "DTSTART:{start}",
-    "DTEND:{end}",
-    "END:VEVENT",
-)
-FORMAT_VCALENDAR_END = (
-    "END:VCALENDAR",
-)
+PRODID = "-//github.com/paalbra//NONSGML gastrounplanner//EN"
+LINESEP = "\r\n"  # CRLF
 
 
 def _format_dt(dt):
+    """ Format a RFC-5545 (3.3.5) - date with local time. """
     return dt.strftime("%Y%m%dT%H%M%S")
 
 
-def _format_ical_shift(shift):
+def _generate_vevent_lines(shift):
+    """ Shift to RFC-5545 (3.6.1) Event Component lines. """
     ident = f"{shift.shift_name}{shift.start}{shift.end}"
-    md5 = hashlib.md5(ident.encode("utf-8"))
-    uid = str(uuid.UUID(md5.hexdigest()))
-    vevent_data = {
-        'uid': uid,
-        'shift_name': shift.shift_name,
-        'start': _format_dt(shift.start),
-        'end': _format_dt(shift.end),
-    }
-    for line in FORMAT_VEVENT:
-        yield line.format(**vevent_data)
+    uid = str(uuid.UUID(hashlib.md5(ident.encode("utf-8")).hexdigest()))
+    start_str = _format_dt(shift.start)
+    end_str = _format_dt(shift.end)
+    yield "BEGIN:VEVENT"
+    yield f"UID:{uid}"
+    yield f"SUMMARY:{shift.shift_name}"
+    yield f"DTSTAMP:{start_str}"
+    yield f"DTSTART:{start_str}"
+    yield f"DTEND:{end_str}"
+    yield "END:VEVENT"
 
 
-def _generate_ical(shifts):
-    for line in FORMAT_VCALENDAR_START:
-        yield line
-
+def _generate_vcalendar_lines(shifts):
+    """ Shift list to RFC-5545 (3.4) iCalendar object lines. """
+    yield "BEGIN:VCALENDAR"
+    yield "VERSION:2.0"
+    yield f"PRODID:{PRODID}"
     for shift in shifts:
-        yield from _format_ical_shift(shift)
-
-    for line in FORMAT_VCALENDAR_END:
-        yield line
-
-    yield ""
+        yield from _generate_vevent_lines(shift)
+    yield "END:VCALENDAR"
+    yield ""  # end with a linesep
 
 
 def format_ical_shifts(shifts):
     """
-    Format a list of shifts into a RFC-5545 iCalendar VCALENDAR object.
+    Format a RFC-5545 iCalendar object from a list of Shifts.
 
-    :param datetime.date date: the base date
-    :param int days_before: start date, in days relative to *date*
-    :param int days_after: end date, in days relative to *date* (not inclusive)
+    :type shifts: iterable[Shift]
 
-    :rtype: iterator[datetime.date]
+    :rtype: str
     """
-    return "\r\n".join(_generate_ical(shifts))
+    return LINESEP.join(_generate_vcalendar_lines(shifts))
 
 
 #
@@ -99,32 +81,33 @@ def format_ical_shifts(shifts):
 
 
 END_OF_DAY = datetime.time.max.replace(microsecond=0)
+""" End of day value. """
 
 
-def parse_time(value, time_format="%H:%M"):
+def _parse_time(value, time_format="%H:%M"):
     # datetime.time.strptime is introduced in 3.14
     dt = datetime.datetime.strptime(value, time_format)
     return dt.time()
 
 
-def parse_timespan(time_range, at_date, truncate=False):
+def parse_timespan(raw_value, at_date, truncate=False):
     """
-    Parse a time range string into a datetime range.
+    Parse a time range string into a naive datetime tuple.
 
-    :param str time_range: time range, e.g. "19:00-23:00"
+    :param str raw_value: time range to parse, e.g. "19:00-23:00"
     :param date at_date: start date for the time range
-    :param bool truncate:
-        Truncate range to END_OF_DAY if it wraps to the next day
+    :param bool truncate: truncate to END_OF_DAY if time range passes midnight
 
     :rtype: tuple[datetime.datetime, datetime.datetime]
+    :returns: start, end
     """
-    logging.debug("parsing time range=%s (at date=%s, truncate=%r)",
-                  repr(time_range), at_date.isoformat(), repr(truncate))
+    logging.debug("parsing timespan=%s (at=%s, truncate=%r)",
+                  repr(raw_value), at_date.isoformat(), repr(truncate))
     start_date = end_date = at_date
 
-    start_time_str, end_time_str = time_range.split("-")
-    start_time = parse_time(start_time_str)
-    end_time = parse_time(end_time_str)
+    start_time_str, end_time_str = raw_value.split("-")
+    start_time = _parse_time(start_time_str)
+    end_time = _parse_time(end_time_str)
 
     if end_time <= start_time:
         # Timestamp passes midnight - we either truncate to end of day, or
@@ -132,7 +115,6 @@ def parse_timespan(time_range, at_date, truncate=False):
         if truncate:
             end_time = END_OF_DAY
         else:
-            # Adjust end day if we are passing midnight, like "21:00-01:00".
             end_date += datetime.timedelta(days=1)
 
     return (
@@ -241,7 +223,7 @@ class GastroUnplanner(object):
 
     def get_shifts(self, days_since, days_until):
         """
-        Get all shifts in a given date range.
+        Get shifts in a given date range.
 
         :param int days_since:
             start date, in days relative to today
@@ -263,12 +245,12 @@ class GastroUnplanner(object):
 
 
 class ShiftExport(object):
-    """ An export setting to apply to a list of shifts. """
+    """ Export settings for a list of shifts. """
 
     def __init__(self, pattern, filename):
         """
-        :type pattern: re.Pattern
-        :type filename: pathlib.Path
+        :param re.Pattern pattern: regex search pattern for Shift.name
+        :param pathlib.Path filename: filename to write shifts to
         """
         self.pattern = pattern
         self.filename = filename
@@ -284,11 +266,11 @@ class ShiftExport(object):
         content = format_ical_shifts(shifts)
         with open(self.filename, "w") as f:
             f.write(content)
-            logging.info("Wrote %d events to %s",
-                         len(shifts), f)
+            logging.info("Wrote %d events to %s", len(shifts), f)
 
     @classmethod
     def from_config(cls, export):
+        """ Get ShiftExport from a config entry. """
         pattern = re.compile(export['name_filter'])
         filename = pathlib.Path(export['file_path'])
         return cls(pattern, filename)
@@ -306,7 +288,6 @@ LOG_VERBOSITY = (
     logging.INFO,
     logging.DEBUG,
 )
-DEFAULT_VERBOSITY = 0
 
 
 def get_log_level(verbosity):
@@ -333,9 +314,13 @@ class JournaldFormatter(logging.Formatter):
     @classmethod
     def get_priority(cls, levelno):
         """ Get journald priority for a given logging level. """
+        if levelno in cls.level_priority_map:
+            return cls.level_priority_map[levelno]
+        # pull down in-between levelno (ERROR-1 -> WARNING):
         for target_level in sorted(cls.level_priority_map, reverse=True):
             if levelno >= target_level:
                 return cls.level_priority_map[target_level]
+        # pull up levelno lower than min(level_priority_map):
         return cls.level_priority_map[min(cls.level_priority_map)]
 
     def format(self, record):
@@ -345,6 +330,7 @@ class JournaldFormatter(logging.Formatter):
 
 
 def setup_logging(verbosity=0, journald=False):
+    """ Configure logging from verbosity. """
     root = logging.getLogger()
     if root.handlers:
         return
@@ -365,12 +351,52 @@ def setup_logging(verbosity=0, journald=False):
     root.setLevel(level)
 
 
+def add_verbosity_args(parser):
+    """ Add verbosity args to an ArgumentParser. """
+    group = parser.add_argument_group(
+        "verbosity",
+        textwrap.dedent(
+            """
+            Adjust debug output to stderr.
+
+            Debug output is controlled by logging, and each -v flag includes
+            more log levels:  ERROR (default), WARNING (-v), INFO (-vv), DEBUG
+            (-vvv).  Disable all logging with -q.
+            """
+        ).lstrip(),
+    )
+
+    mutex = group.add_mutually_exclusive_group()
+    mutex.add_argument(
+        "-v",
+        action="count",
+        dest="verbosity",
+        help="increase verbosity",
+    )
+    mutex.add_argument(
+        "-q",
+        action="store_const",
+        const=-1,
+        dest="verbosity",
+        help="suppress all debug output",
+    )
+    mutex.set_defaults(verbosity=0)
+
+    group.add_argument(
+        "--journald",
+        action="store_true",
+        help="use journald format (priority prefix)",
+    )
+
+    return group
+
+
 #
 # Script
 #
 
 
-parser = argparse.ArgumentParser(
+arg_parser = argparse.ArgumentParser(
     description=textwrap.dedent(
         """
         Create iCal feeds from a https://gastroplanner.eu/ instance.
@@ -380,25 +406,24 @@ parser = argparse.ArgumentParser(
         """
     ).lstrip(),
     formatter_class=argparse.RawDescriptionHelpFormatter,
-
 )
-parser.add_argument(
+arg_parser.add_argument(
     "config",
     help="A TOML config (required)",
 )
 
-arg_range = parser.add_argument_group(
+range_args = arg_parser.add_argument_group(
     "date range",
     "Select date range for shifts to include, relative to today",
 )
-arg_range.add_argument(
+range_args.add_argument(
     "--since",
     type=int,
     default=-7,
     help="Start at today + %(metavar)s days (default: %(default)s)",
     metavar="N",
 )
-arg_range.add_argument(
+range_args.add_argument(
     "--until",
     type=int,
     default=30,
@@ -406,35 +431,13 @@ arg_range.add_argument(
           " (default: %(default)s)"),
     metavar="N",
 )
+del range_args
 
-arg_logging = parser.add_argument_group(
-    "verbosity",
-    "Adjust debug output to stderr (logging)",
-)
-verbosity_mutex = arg_logging.add_mutually_exclusive_group()
-verbosity_mutex.add_argument(
-    "-v",
-    action="count",
-    dest="verbosity",
-    help="increase verbosity",
-)
-verbosity_mutex.add_argument(
-    "-q",
-    action="store_const",
-    const=-1,
-    dest="verbosity",
-    help="suppress all debug output",
-)
-verbosity_mutex.set_defaults(verbosity=0)
-arg_logging.add_argument(
-    "--journald",
-    action="store_true",
-    help="use journald format (priority prefix)",
-)
+add_verbosity_args(arg_parser)
 
 
 def main(argv=None):
-    args = parser.parse_args(argv)
+    args = arg_parser.parse_args(argv)
     setup_logging(args.verbosity, args.journald)
 
     logging.info("start")
@@ -443,9 +446,10 @@ def main(argv=None):
         config = tomllib.load(f)
 
     exports = tuple(ShiftExport.from_config(e) for e in config['exports'])
-    logging.info("generating %d exports...")
+    logging.info("generating %d exports...", len(exports))
     if not exports:
-        parser.error("no exports configured")
+        logging.error("no exports in config")
+        raise SystemExit(1)
 
     gu = GastroUnplanner(config["url"])
     gu.login(config["email"], config["password"])
