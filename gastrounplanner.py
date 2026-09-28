@@ -6,7 +6,9 @@ import collections
 import datetime
 import hashlib
 import logging
+import pathlib
 import re
+import textwrap
 import tomllib
 import uuid
 
@@ -86,7 +88,7 @@ def format_ical_shifts(shifts):
 
 
 #
-# Shift parsing
+# Shift lookup, parsing, and export
 #
 
 
@@ -104,7 +106,7 @@ def parse_timespan(time_range, at_date, truncate=False):
 
     :rtype: tuple[datetime.datetime, datetime.datetime]
     """
-    logging.debug("Parsing time range=%s (at date=%s, truncate=%r)",
+    logging.debug("parsing time range=%s (at date=%s, truncate=%r)",
                   repr(time_range), at_date.isoformat(), repr(truncate))
     start_date = end_date = at_date
 
@@ -128,13 +130,13 @@ def parse_timespan(time_range, at_date, truncate=False):
     )
 
 
-def parse_shifts(content, date, truncate=False):
+def parse_shifts(content, at_date, truncate=False):
     """
     Parse day shifts into Shift tuples.
 
-    :param str content: shifts page content
-    :param datetime.date date: the date these shifts are for
-    :param bool truncate: truncate shifts to END_OF_DAY if they pass midnight
+    :param str content: page content
+    :param datetime.date at_date: see parse_timespan
+    :param bool truncate: see parse_timespan
 
     :rtype: iterator[Shift]
     """
@@ -144,24 +146,25 @@ def parse_shifts(content, date, truncate=False):
         # Each tr is a single shift.
         # The children tds contain data about the shift.
 
-        logging.debug("Parsing shift/html table row: %s", tr)
+        logging.debug("parsing shift/html table row: %s", tr)
 
         tds = tr.find_all("td")
 
         # Some shifts have some extra weird values after the third one
-        name, _, shift_name, *_ = [element.text for element in tds[0].children]
+        name, _, shift_name = [element.text for element in tds[0].children][:3]
 
         if shift_name == "":
-            logging.warning("Skipping empty shift?: %s", repr(tr))
+            logging.warning("skipping empty shift?: %s", repr(tr))
             continue
 
         shift_timespan = tds[1].text
-        start_time, end_time = parse_timespan(shift_timespan, date, truncate)
+        start, end = parse_timespan(shift_timespan, at_date, truncate)
 
-        yield Shift(name, shift_name, start_time, end_time)
+        yield Shift(name, shift_name, start, end)
 
 
-class GastroUnplanner():
+class GastroUnplanner(object):
+    """ Log in and find Shifts in GastroPlanner. """
 
     def __init__(self, base_url):
         self.base_url = base_url.rstrip("/") + "/"
@@ -187,6 +190,7 @@ class GastroUnplanner():
 
     def login(self, login_email, login_password):
         """ Perform a login for the current session. """
+        logging.debug("logging in")
         response = self.session.post(
             self.login_url,
             data={
@@ -210,6 +214,7 @@ class GastroUnplanner():
 
         :rtype: iterator[Shift]
         """
+        logging.debug("Looking up shifts at %s", date.isoformat())
         response = self.session.post(
             self.shifts_url,
             data={
@@ -246,43 +251,202 @@ class GastroUnplanner():
             yield from self.get_shifts_at(date)
 
 
+class ShiftExport(object):
+    """ An export setting to apply to a list of shifts. """
+
+    def __init__(self, pattern, filename):
+        """
+        :type pattern: re.Pattern
+        :type filename: pathlib.Path
+        """
+        self.pattern = pattern
+        self.filename = filename
+
+    def select_shifts(self, iterable):
+        """ Select matching shifts from an iterable of shifts. """
+        for shift in iterable:
+            if self.pattern.search(shift.name):
+                yield shift
+
+    def write_shifts(self, shifts):
+        """ Write a list of shifts to the given file. """
+        content = format_ical_shifts(shifts)
+        with open(self.filename, "w") as f:
+            f.write(content)
+            logging.info("Wrote %d events to %s",
+                         len(shifts), f)
+
+    @classmethod
+    def from_config(cls, export):
+        pattern = re.compile(export['name_filter'])
+        filename = pathlib.Path(export['file_path'])
+        return cls(pattern, filename)
+
+
+#
+# Logging / verbosity setup
+#
+
+
+LOG_FORMAT = "%(levelname)s - %(name)s - %(message)s"
+LOG_VERBOSITY = (
+    logging.ERROR,
+    logging.WARNING,
+    logging.INFO,
+    logging.DEBUG,
+)
+DEFAULT_VERBOSITY = 0
+
+
+def get_log_level(verbosity):
+    verbosity_idx = max(0, min(len(LOG_VERBOSITY) - 1, verbosity))
+    return LOG_VERBOSITY[verbosity_idx]
+
+
+class JournaldFormatter(logging.Formatter):
+    """
+    This formatter prefixes log records with a priority prefix for journald.
+
+    Otherwise the formatter works just like the default Formatter class.  Note
+    that any formatting errors (incorrect format strings, etc...) are dealt
+    with by the log handler, and won't be prefixed correctly.
+    """
+
+    level_priority_map = {
+        logging.DEBUG: 7,    # debug
+        logging.INFO: 6,     # info
+        logging.WARNING: 4,  # warning
+        logging.ERROR: 3,    # err
+    }
+
+    @classmethod
+    def get_priority(cls, levelno):
+        """ Get journald priority for a given logging level. """
+        for target_level in sorted(cls.level_priority_map, reverse=True):
+            if levelno >= target_level:
+                return cls.level_priority_map[target_level]
+        return cls.level_priority_map[min(cls.level_priority_map)]
+
+    def format(self, record):
+        prefix = "<{}>".format(self.get_priority(record.levelno))
+        lines = super().format(record).split("\n")
+        return "\n".join(prefix + line for line in lines)
+
+
+def setup_logging(verbosity=0, journald=False):
+    root = logging.getLogger()
+    if root.handlers:
+        return
+
+    formatter_class = JournaldFormatter if journald else logging.Formatter
+
+    if verbosity < 0:
+        root.addHandler(logging.NullHandler())
+    else:
+        # This is more or less basicConfig() with *only* a format
+        # setting and a custom Formatter class.
+        handler = logging.StreamHandler()
+        formatter = formatter_class(LOG_FORMAT, None, "%")
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+
+    level = get_log_level(int(verbosity))
+    root.setLevel(level)
+
+
 #
 # Script
 #
 
 
 parser = argparse.ArgumentParser(
-    description="Creates an ical from a https://gastroplanner.eu/ instance."
+    description=textwrap.dedent(
+        """
+        Create iCal feeds from a https://gastroplanner.eu/ instance.
+
+        Writes one RFC-5545 (iCalendar) feed for each *export* in the mandatory
+        *config*.
+        """
+    ).lstrip(),
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+
 )
-parser.add_argument("config")
-parser.add_argument("--since", type=int, default=-7)
-parser.add_argument("--until", type=int, default=30)
+parser.add_argument(
+    "config",
+    help="A TOML config (required)",
+)
+
+arg_range = parser.add_argument_group(
+    "date range",
+    "Select date range for shifts to include, relative to today",
+)
+arg_range.add_argument(
+    "--since",
+    type=int,
+    default=-7,
+    help="Start at today + %(metavar)s days (default: %(default)s)",
+    metavar="N",
+)
+arg_range.add_argument(
+    "--until",
+    type=int,
+    default=30,
+    help=("End at today + %(metavar)s days - not inclusive"
+          " (default: %(default)s)"),
+    metavar="N",
+)
+
+arg_logging = parser.add_argument_group(
+    "verbosity",
+    "Adjust debug output to stderr (logging)",
+)
+verbosity_mutex = arg_logging.add_mutually_exclusive_group()
+verbosity_mutex.add_argument(
+    "-v",
+    action="count",
+    dest="verbosity",
+    help="increase verbosity",
+)
+verbosity_mutex.add_argument(
+    "-q",
+    action="store_const",
+    const=-1,
+    dest="verbosity",
+    help="suppress all debug output",
+)
+verbosity_mutex.set_defaults(verbosity=0)
+arg_logging.add_argument(
+    "--journald",
+    action="store_true",
+    help="use journald format (priority prefix)",
+)
 
 
 def main(argv=None):
     args = parser.parse_args(argv)
+    setup_logging(args.verbosity, args.journald)
 
-    logging.basicConfig(level=logging.WARNING)
+    logging.info("start")
 
     with open(args.config, "rb") as f:
         config = tomllib.load(f)
 
+    exports = tuple(ShiftExport.from_config(e) for e in config['exports'])
+    logging.info("generating %d exports...")
+    if not exports:
+        parser.error("no exports configured")
+
     gu = GastroUnplanner(config["url"])
     gu.login(config["email"], config["password"])
 
-    # Get shifts. Since 7 days ago and until 30 days forward, by default.
-    shifts = gu.get_shifts(args.since, args.until)
+    all_shifts = list(gu.get_shifts(args.since, args.until))
+    logging.info("found %d total shifts", len(all_shifts))
 
-    for export in config["exports"]:
-        export_shifts = [
-            shift
-            for shift in shifts
-            if re.search(export["name_filter"], shift.name)
-        ]
-        ical = format_ical_shifts(export_shifts)
+    for export in exports:
+        shifts = list(export.select_shifts(all_shifts))
+        export.write_shifts(shifts)
 
-        with open(export["file_path"], "w") as f:
-            f.write(ical)
+    logging.info("done")
 
 
 if __name__ == "__main__":
